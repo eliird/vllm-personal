@@ -1,0 +1,13 @@
+# Generated outputs (never commit)
+logs/
+plots/
+snapshots/
+scripts/dev/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS/editor
+.DS_Store
+*.swp

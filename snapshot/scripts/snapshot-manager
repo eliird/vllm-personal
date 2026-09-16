@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Thin external snapshot manager for a warm vLLM worker (CRIU + cuda-checkpoint).
+
+It does not modify vLLM: it drives an already-running worker (quiesce via the dev
+endpoints, optional sleep, then CRIU dump) and restores from the saved images,
+hard-failing on an incompatible stack.
+
+Commands:
+    snapshot-manager create  <name> --pid <pid> [--port P] [--model M] [--sleep 0|1|2]
+    snapshot-manager restore <name> [--port P] [--wake]
+    snapshot-manager list
+    snapshot-manager status  <name>
+    snapshot-manager delete  <name>
+
+Run with sudo for create/restore (CRIU needs root). Snapshots live under
+snapshot/snapshots/<name>/ with a metadata.json.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+SNAP = HERE.parent
+ROOT = Path(os.environ.get("VLLM_HOME", SNAP.parent))  # vLLM checkout
+SNAPDIR = SNAP / "snapshots"
+VLLM = ROOT / ".venv" / "bin" / "vllm"
+PY = ROOT / ".venv" / "bin" / "python"
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def sudo() -> list[str]:
+    return [] if os.geteuid() == 0 else ["sudo"]
+
+
+def sh(cmd: list[str]) -> str:
+    p = run(cmd)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def stack_metadata(model: str, sleep: int) -> dict:
+    driver = sh(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
+    gpus = sh(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]).splitlines()
+    cuda = ""
+    if PY.exists():
+        cuda = sh([str(PY), "-c", "import torch;print(torch.version.cuda or '')"])
+    vllm = ""
+    if PY.exists():
+        vllm = sh([str(PY), "-c", "import vllm;print(vllm.__version__)"])
+    return {
+        "snapshot_version": 1,
+        "model": model,
+        "vllm_version": vllm,
+        "cuda_version": cuda,
+        "driver_version": driver,
+        "gpu": gpus[0] if gpus else "",
+        "gpu_count": len(gpus),
+        "sleep": sleep,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    d = SNAPDIR / args.name
+    if d.exists():
+        print(f"refusing: {d} already exists", file=sys.stderr)
+        return 1
+    d.mkdir(parents=True)
+    port = args.port
+
+    if args.sleep:
+        url = f"http://127.0.0.1:{port}/sleep?level={args.sleep}"
+        code = sh(["curl", "-s", "-X", "POST", url, "-o", "/dev/null",
+                   "-w", "%{http_code}"])
+        print(f"sleep(level={args.sleep}) -> {code}")
+        time.sleep(2)
+
+    cmd = sudo() + ["criu", "dump", "--shell-job", "--tree", str(args.pid),
+                    "--images-dir", str(d), "--tcp-established", "--link-remap"]
+    print("criu dump...")
+    p = run(cmd)
+    (d / "dump.log").write_text(p.stdout + p.stderr)
+    if p.returncode != 0:
+        print("dump FAILED:\n" + (p.stdout + p.stderr)[-2000:], file=sys.stderr)
+        return 1
+
+    meta = stack_metadata(args.model or "?", args.sleep)
+    meta["pid"] = args.pid
+    meta["images_bytes"] = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+    (d / "metadata.json").write_text(json.dumps(meta, indent=2))
+    print(f"created {args.name}: {meta['images_bytes']/1e9:.2f} GB, "
+          f"driver={meta['driver_version']} gpu={meta['gpu']}")
+    return 0
+
+
+def _check_compatible(meta: dict) -> list[str]:
+    cur = stack_metadata(meta.get("model", "?"), meta.get("sleep", 0))
+    problems = []
+    for key in ("driver_version", "gpu_count", "gpu", "cuda_version"):
+        if meta.get(key) != cur.get(key):
+            problems.append(f"{key}: snapshot={meta.get(key)!r} host={cur.get(key)!r}")
+    return problems
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    d = SNAPDIR / args.name
+    meta_file = d / "metadata.json"
+    if not meta_file.exists():
+        print(f"no such snapshot: {args.name}", file=sys.stderr)
+        return 1
+    meta = json.loads(meta_file.read_text())
+
+    problems = _check_compatible(meta)
+    if problems:
+        print("REFUSING restore — incompatible host:", file=sys.stderr)
+        for p in problems:
+            print("  " + p, file=sys.stderr)
+        return 2
+
+    cmd = sudo() + ["criu", "restore", "--restore-detached",
+                    "--images-dir", str(d), "--tcp-established"]
+    print("criu restore...")
+    p = run(cmd)
+    (d / "restore.log").write_text(p.stdout + p.stderr)
+    if p.returncode != 0:
+        print("restore FAILED:\n" + (p.stdout + p.stderr)[-2000:], file=sys.stderr)
+        return 1
+
+    if meta.get("sleep") or args.wake:
+        sh(["curl", "-s", "-X", "POST", f"http://127.0.0.1:{args.port}/wake_up",
+            "-o", "/dev/null", "-w", "%{http_code}"])
+    print(f"restored {args.name} (sleep={meta.get('sleep', 0)})")
+    return 0
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    if not SNAPDIR.exists():
+        print("(no snapshots)")
+        return 0
+    for d in sorted(SNAPDIR.iterdir()):
+        mf = d / "metadata.json"
+        if not mf.exists():
+            print(f"{d.name}\t(incomplete)")
+            continue
+        m = json.loads(mf.read_text())
+        gb = m.get("images_bytes", 0) / 1e9
+        print(f"{d.name}\t{gb:5.1f} GB\tsleep={m.get('sleep')}\t"
+              f"driver={m.get('driver_version')}\t{m.get('created_at')}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    mf = SNAPDIR / args.name / "metadata.json"
+    if not mf.exists():
+        print("not found", file=sys.stderr)
+        return 1
+    print(mf.read_text())
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    d = SNAPDIR / args.name
+    if not d.exists():
+        print("not found", file=sys.stderr)
+        return 1
+    shutil.rmtree(d)
+    print(f"deleted {args.name}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="snapshot-manager")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create")
+    c.add_argument("name")
+    c.add_argument("--pid", type=int, required=True)
+    c.add_argument("--port", type=int, default=8000)
+    c.add_argument("--model", default=None)
+    c.add_argument("--sleep", type=int, default=0, choices=[0, 1, 2])
+    c.set_defaults(func=cmd_create)
+
+    r = sub.add_parser("restore")
+    r.add_argument("name")
+    r.add_argument("--port", type=int, default=8000)
+    r.add_argument("--wake", action="store_true")
+    r.set_defaults(func=cmd_restore)
+
+    sub.add_parser("list").set_defaults(func=cmd_list)
+
+    s = sub.add_parser("status")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_status)
+
+    dl = sub.add_parser("delete")
+    dl.add_argument("name")
+    dl.set_defaults(func=cmd_delete)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

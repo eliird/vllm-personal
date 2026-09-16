@@ -15,7 +15,8 @@
 # be miscounted as weight load.
 set -uo pipefail
 SNAP="$(cd "$(dirname "$0")/.." && pwd)"   # snapshot/
-ROOT="$(cd "$SNAP/.." && pwd)"             # repo root (holds .venv/)
+VLLM_HOME="${VLLM_HOME:-$(cd "$SNAP/.." && pwd)}"  # vLLM checkout (holds .venv/)
+ROOT="$VLLM_HOME"
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8000}"

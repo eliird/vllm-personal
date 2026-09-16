@@ -81,6 +81,64 @@ dominated by `C+G+U`; warm still re-pays `W` and `G`; snapshot removes them all.
 Projections: 80 GB card (u=0.9) → S≈75 GB → ~37 s; 500B-class 4-bit capped →
 S≈275 GB (weights-dominated) → ~135 s, the case Phase 9 targets.
 
+### Phase 6/7 — sleep / KV discard
+
+`/sleep?level=1` offloads weights to CPU pinned RAM and discards the KV cache
+(no SSD involved; `level=2` discards both with no backup).
+
+| | Full worker | Slept worker (`level=1`) |
+| --- | ---: | ---: |
+| GPU memory before dump | 14.8 GiB | **1.81 GiB** |
+| Image on disk | 17.1 GB | **14.7 GB** (−2.3) |
+| CRIU dump | 13–15 s | 8.8 s |
+| `criu restore` call | 8.0–8.7 s | **4.7 s** |
+| restore → first response | 8.44 s | **7.95 s** |
+| correctness | PASS | PASS |
+
+vLLM reports: `sleep freed 12.07 GiB … 7.72 GiB backed up in CPU … 4.36 GiB
+discarded … 1.81 GiB still in use`. Diagnosis (`crit` on the images): the model
+file is not mmap'd into the image; the slept image is dominated by the **7.72 GiB
+weights CPU backup** + host/CUDA-driver memory. The 4.36 GiB KV discard only
+netted **−2.3 GB** on disk because ~2 GB of host/driver bookkeeping (and 7→158
+shm segments) reappears after sleep.
+
+**Conclusion:** KV placeholding saves nothing (KV is already discarded); the
+lever is **Phase 9 — keep weights out of the image** (`level=2` + reload/resident
+weights).
+
+### Phase 8 — restore profile
+
+Slept (`level=1`) restore decomposition:
+
+| Stage | Time |
+| --- | ---: |
+| `criu restore` (read 14.7 GB image + restore host pages) | 3.6 s (~4 GB/s) |
+| `wake_up` (host→device weights ~7.7 GB + KV realloc) | ~0.9 s |
+| ready after wake | ~2.0 s |
+| first response | +0.27 s |
+| **total restore → first response** | **6.8 s** |
+
+### Phase 9 — weight separation (size achieved; reload still needed)
+
+`sleep(level=2)` discards weights and KV with **no CPU backup**
+(`0.00 GiB backed up; 13.37 GiB discarded`):
+
+| | Full | Slept L1 | **Slept L2** |
+| --- | ---: | ---: | ---: |
+| Image | 17.1 GB | 14.7 GB | **3.4 GB** |
+| CRIU dump | 13–15 s | 8.8 s | **2.0 s** |
+| GPU after sleep | — | 1.8 GiB | 1.2 GiB |
+| `criu restore` | 8.0–8.7 s | 4.7 s | **1.8 s** |
+| restore → first response | 8.44 s | 7.95 s | **4.36 s** |
+| correct? | yes | yes | **no — garbage** |
+
+**3.4 GB is the size ceiling** (weights fully out of the image). But a `level=2`
+restore serves garbage (`"!!!!!!!!"`) because the weights are gone and vLLM has
+no disk-reload on wake — `update_weights` is a trainer→worker transport, not a
+reload. Completing Phase 9 needs a reload hook (a `SleepModeBackend` plugin or an
+equivalent path) before the "correct inference" gate can pass. **This is a design
+decision for the next phase.**
+
 ---
 
 ## 2. Install
@@ -130,6 +188,11 @@ criu --version && ls /usr/lib/criu/cuda_plugin.so
 cuda-checkpoint --help 2>&1 | head -2
 .venv/bin/python -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
 ```
+
+> This repo is standalone: the scripts find the vLLM checkout (and its `.venv`)
+> via `VLLM_HOME`, defaulting to the **parent directory**. Point it elsewhere with
+> `export VLLM_HOME=/path/to/vllm-personal`. The pinned vLLM commit/wheel is in
+> [`vllm.lock`](vllm.lock).
 
 ---
 
@@ -188,16 +251,27 @@ Swapping `MODEL`/`TAG` gives the MoE run
 
 ## 4. Open issues and roadmap
 
-### 4.1 `/dev/shm` link-remap makes snapshots one-shot  *(known blocker)*
+### 4.1 `/dev/shm` link-remap made snapshots one-shot  *(fixed)*
 vLLM's engine runs in a Python multiprocessing child; CPython creates POSIX
 semaphores `/dev/shm/sem.mp-*` (hard-linked twice). CRIU needs `--link-remap`,
-but the `link_remap.*` temp is **not stored in the image**, so the first restore
-consumes it and later restores fail:
+but the `link_remap.*` temp was consumed/renamed by the first restore, so later
+restores failed with
 `Can't link dev/shm/link_remap.N -> dev/shm/sem.X: No such file or directory`.
-- Workaround: clean `/dev/shm` before snapshot, restore once, re-snapshot.
-- Planned fix: **patch CRIU** (on a branch) to store/recreate the link-remap temp
-  from the image, making snapshots reusable. (Running vLLM single-process
-  `VLLM_ENABLE_V1_MULTIPROCESSING=0` avoids the semaphores but costs performance.)
+
+**Fix:** a small CRIU patch, `patches/criu-link-remap-reusable.patch`, recreates
+the missing `link_remap.*` source (sized from the dumped file) and retries the
+link, making images reusable. Maintained as a fork of CRIU:
+**https://github.com/eliird/CRIU-multiprocess** (branch
+`snapshot/link-remap-reusable`, set as the default branch; commit
+"restore: recreate missing link-remap source so images are reusable"). Verified:
+the **same image restored twice** (8.31 s then 8.04 s, both correct). Build it
+from the fork (`git clone`, `make`, `make install-criu install-cuda_plugin`, copy
+`cuda_plugin.so` to `/usr/lib/criu/`) or `git am` the patch onto upstream CRIU.
+
+> Reaping the restored process tree fully between restores matters: a leftover
+> process makes the next restore fail with `Can't fork for <pid>: File exists`.
+> (Running vLLM single-process `VLLM_ENABLE_V1_MULTIPROCESSING=0` also avoids the
+> semaphores, but costs performance.)
 
 ### 4.2 Image size = full device state  *(optimization)*
 Images (~17 GB) capture the entire GPU footprint, dominated by the **idle KV
@@ -219,13 +293,28 @@ graph replay). Fold into Phase 6/7 verification.
 | 1 cold/warm decomposition | done (Qwen3-4B + MoE) |
 | 2 CRIU characterization | done, verified |
 | 3 cuda-checkpoint characterization | done, verified |
-| 4 snapshot/restore (unoptimized) | done for both models; hardening pending |
-| 5 quiesce lifecycle + thin `snapshot-manager` CLI | not started |
-| 6+7 sleep / KV discard | not started (largest win) |
-| 8 restore profiling, lazy-pages, parallel I/O | not started |
-| 9 weight separation | optional here; essential at scale |
+| 4 snapshot/restore (unoptimized) | done for both models; repeat-restore fixed by the CRIU patch |
+| 5 quiesce lifecycle + thin `snapshot-manager` CLI | done (create/restore/list/status/delete + compatibility guard) |
+| 6+7 sleep / KV discard | done: GPU 14.8→1.8 GiB, image 17.1→14.7 GB, restore 8.44→6.8 s |
+| 8 restore profiling | done: CRIU 3.6 s + wake 0.9 s + ready 2.0 s |
+| 9 weight separation | size ceiling reached (image **3.4 GB**); needs a weight-reload hook to serve |
 | 10 multi-GPU / TP-EP | N/A (single GPU) |
-| 11 production manager (create/list/restore/delete, driver guard) | not started |
+| 11 production manager (create/list/restore/delete, driver guard) | done (same CLI) |
+
+#### `snapshot-manager`
+
+```bash
+# create from an already-running worker (quiesce via /sleep, then CRIU dump)
+sudo .venv/bin/python snapshot/scripts/snapshot-manager create <name> \
+  --pid <vllm-pid> --port <port> --model Qwen/Qwen3-4B --sleep 1
+.venv/bin/python snapshot/scripts/snapshot-manager list
+.venv/bin/python snapshot/scripts/snapshot-manager status <name>
+sudo .venv/bin/python snapshot/scripts/snapshot-manager restore <name> --port <port>
+.venv/bin/python snapshot/scripts/snapshot-manager delete <name>
+```
+Verified end-to-end: create (14.6 GB) → restore → correct inference → delete. A
+driver/GPU/CUDA mismatch on restore is **refused** (exit 2), so snapshots are
+documented as ephemeral across driver upgrades.
 
 ### 4.5 Scale / production
 - **Kubernetes**: this is non-K8s today. At scale we need a per-Pod sidecar/manager

@@ -7,7 +7,8 @@
 #   IMG=/tmp/p4_snap   EXTRA_ARGS="..."   MAX_MODEL_LEN=4096   GPU_MEM_UTIL=0.90
 set -uo pipefail
 SNAP="$(cd "$(dirname "$0")/.." && pwd)"   # snapshot/
-ROOT="$(cd "$SNAP/.." && pwd)"             # repo root (holds .venv/)
+VLLM_HOME="${VLLM_HOME:-$(cd "$SNAP/.." && pwd)}"  # vLLM checkout (holds .venv/)
+ROOT="$VLLM_HOME"
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8000}"
@@ -18,6 +19,8 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 PROMPT="${PROMPT:-The capital of France is}"
+SLEEP="${SLEEP:-0}"
+SLEEP_FLAG=""; [ "$SLEEP" != "0" ] && SLEEP_FLAG="--enable-sleep-mode"
 
 LOGDIR="${LOGDIR:-$SNAP/logs}"; mkdir -p "$LOGDIR"
 VLOG="$LOGDIR/p4_${TAG}_vllm.log"
@@ -35,9 +38,9 @@ echo "launch: vllm serve $MODEL --port $PORT (mode=$MODE)" | tee -a "$VLOG"
 # Log to a regular file (not a FIFO): CRIU must be able to reopen stdout on
 # restore, and a deleted FIFO breaks restore.
 # shellcheck disable=SC2086
-setsid env UV_USE_IO_URING=0 PYTHONUNBUFFERED=1 "$ROOT/.venv/bin/vllm" serve "$MODEL" --port "$PORT" \
+setsid env UV_USE_IO_URING=0 VLLM_SERVER_DEV_MODE=1 PYTHONUNBUFFERED=1 "$ROOT/.venv/bin/vllm" serve "$MODEL" --port "$PORT" \
   --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" \
-  $EXTRA_ARGS >> "$VLOG" 2>&1 &
+  $SLEEP_FLAG $EXTRA_ARGS >> "$VLOG" 2>&1 &
 SRV=$!
 cleanup() {
   kill -TERM -- "-$SRV" 2>/dev/null || true
@@ -67,6 +70,14 @@ pgrep -P "$ROOT_PID" 2>/dev/null | while read -r c; do echo "child=$c $(cat /pro
 
 # Quiesce: no new requests.
 sleep 2
+
+if [ "$SLEEP" != "0" ]; then
+  echo "=== sleep(level=$SLEEP): discard KV (and weights if level=2) ===" | tee -a "$VLOG"
+  curl -s -X POST "http://127.0.0.1:$PORT/sleep?level=$SLEEP" -o /dev/null -w "sleep_http=%{http_code}\n"
+  sleep 2
+  echo "is_sleeping=$(curl -s http://127.0.0.1:$PORT/is_sleeping)"
+  echo "gpu_after_sleep=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
+fi
 
 echo "=== criu dump (mode=$MODE) ===" | tee -a "$VLOG"
 DUMP_T0=$(date +%s.%N)

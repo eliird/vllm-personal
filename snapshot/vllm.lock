@@ -1,0 +1,11 @@
+# vLLM dependency pin for the snapshot work
+#
+# The scripts use VLLM_HOME (default: the parent directory) to find the vLLM
+# checkout and its .venv. Point it at a checkout of:
+repo:        git@github.com:eliird/vllm-personal.git
+branch:      feat/checkpoint-restore
+commit:      7d88354c14
+base_commit: 8263ea12bd   # upstream commit the precompiled wheel is built for
+vllm:        0.29.1rc1.dev135+g39651f804.precompiled
+wheel:       VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
+python:      3.12

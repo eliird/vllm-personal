@@ -259,3 +259,5 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 snapshot/logs/
 snapshot/scripts/dev/
 snapshot/plots/
+
+snapshot/snapshots/

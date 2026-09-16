@@ -14,6 +14,7 @@ MODE="${MODE:-plugin}"
 IMG="${IMG:-/tmp/p4_snap_$TAG}"
 PROMPT="${PROMPT:-The capital of France is}"
 EXPECT="${EXPECT:-Paris}"
+SLEEP="${SLEEP:-0}"
 
 LOGDIR="${LOGDIR:-$SNAP/logs}"; mkdir -p "$LOGDIR"
 if [ "$(id -u)" -eq 0 ]; then SUDO_CRIU=""; else SUDO_CRIU="sudo"; fi
@@ -30,6 +31,13 @@ if [ "$MODE" = "manual" ]; then
   for p in $(pgrep -f 'VLLM::EngineCore' 2>/dev/null); do
     $SUDO_CRIU cuda-checkpoint --toggle --pid "$p" 2>&1 || true
   done
+fi
+
+if [ "$SLEEP" != "0" ]; then
+  echo "=== wake_up (reload weights host->device, realloc KV) ==="
+  curl -s -X POST "http://127.0.0.1:$PORT/wake_up" -o /dev/null -w "wake_http=%{http_code}\n"
+  T_WAKE=$(date +%s.%N)
+  sleep 2
 fi
 
 ready=0
@@ -58,9 +66,13 @@ echo "restore_to_first_response_seconds=$(awk -v a="$T0" -v b="$T_FIRST" 'BEGIN{
 R_CALL=$(awk -v a="$T0" -v b="$T_RET" 'BEGIN{printf "%.3f",b-a}')
 R_READY=$(awk -v a="$T0" -v b="$T_READY" 'BEGIN{printf "%.3f",b-a}')
 R_FIRST=$(awk -v a="$T0" -v b="$T_FIRST" 'BEGIN{printf "%.3f",b-a}')
+W_SEC="null"
+if [ "${SLEEP:-0}" != "0" ] && [ -n "${T_WAKE:-}" ]; then
+  W_SEC=$(awk -v a="$T0" -v b="$T_WAKE" 'BEGIN{printf "%.3f",b-a}')
+fi
 if grep -q "$EXPECT" "$LOGDIR/p4_${TAG}_post_restore_response.json"; then ok=true; else ok=false; fi
 cat > "$LOGDIR/p4_${TAG}_restore_times.json" <<JSON
-{"tag":"$TAG","model":"$MODEL","mode":"$MODE","restore_call_seconds":$R_CALL,"restore_to_ready_seconds":$R_READY,"restore_to_first_response_seconds":$R_FIRST,"correct":$ok}
+{"tag":"$TAG","model":"$MODEL","mode":"$MODE","sleep":${SLEEP:-0},"restore_call_seconds":$R_CALL,"wake_seconds":$W_SEC,"restore_to_ready_seconds":$R_READY,"restore_to_first_response_seconds":$R_FIRST,"correct":$ok}
 JSON
 
 if grep -q "$EXPECT" "$LOGDIR/p4_${TAG}_post_restore_response.json"; then
