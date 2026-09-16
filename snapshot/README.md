@@ -1,0 +1,243 @@
+# vLLM snapshot / restore (CRIU + `cuda-checkpoint`)
+
+Non-Kubernetes snapshot/restore for a warm vLLM worker, using CRIU + NVIDIA
+`cuda-checkpoint`, to cut **start restore → first correct inference** from
+minutes to seconds on a single GPU.
+
+![Qwen3-4B: cold vs warm vs snapshot restore](images/startup_breakdown_qwen3_4b.png)
+
+**Headline (RTX 4060 Ti 16 GB):** cold start **130 s** → warm **40 s** →
+**snapshot restore 8.4 s**, one correct inference. The MoE model is the same
+(`images/startup_breakdown_moe.png`).
+
+---
+
+## 1. What this is
+
+We checkpoint a *warm, quiesced* vLLM worker with CRIU (process state) plus
+`cuda-checkpoint` (GPU state), kill it, restore it, and serve an inference. The
+snapshot captures the CUDA context, compiled graphs, and allocator state that a
+normal warm restart still has to rebuild — only the weight bytes still cross
+disk.
+
+Measured workloads (device-resident on 16 GB):
+
+| Role | Model | GPU weights |
+| --- | --- | ---: |
+| dense | `Qwen/Qwen3-4B` (bf16) | 7.56 GiB |
+| MoE | `Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4` (4-bit) | 7.91 GiB |
+
+`gpt-oss-20b` (13.8 GB MXFP4) does **not** fit 16 GB without CPU offload and is
+excluded.
+
+### Results
+
+| Model | cold ready | warm ready | restore→ready | restore→first resp. | vs warm | vs cold |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Qwen3-4B | 130.5 s | 40.5 s | 8.17 s | **8.44 s** | 4.8× | 15.5× |
+| MoE (GPTQ-Int4) | 108.8 s | 36.4 s | 8.47 s | **8.58 s** | 4.2× | 12.7× |
+
+Detailed per-phase narrative: [`report.md`](report.md). Independent verifier
+verdicts: [`results/verification/`](results/verification/). Exact stack:
+[`results/stack.txt`](results/stack.txt).
+
+### Why restore is ~constant across models
+
+Both configs use `--gpu-memory-utilization 0.9`, so vLLM sizes the KV cache to
+fill the card. The checkpoint captures **all device memory** (weights + KV +
+activations + context) plus host pages:
+
+```
+S ≈ u·V + H                              (VRAM-filling regime, u = util, V = VRAM)
+T_restore ≈ S / B_eff + t_ctx            B_eff ≈ 2.0 GB/s on this NVMe/driver
+```
+
+Both images are **~17 GB** → both restore in ~8.5 s. Image composition (Qwen3-4B)
+is one 16 GB `pages-10.img` (device→host copy of weights+KV) + ~1 GB host,
+uncompressed.
+
+### How the times scale
+
+```
+T_cold ≈ P + W + C(L) + G(L,b) + U       (P=process/API, W=weights, C=compile,
+T_warm ≈ P + W + G(L,b)                   G=graph capture, U=warmup/autotune)
+T_restore ≈ S / B_eff
+S ≈ u·V + H                    (KV fills the card)
+S ≈ W + KV + A + H             (KV capped / slept / weights-in-image)
+```
+
+| term | grows with | Qwen3-4B cold/warm | MoE cold/warm |
+| --- | --- | ---: | ---: |
+| `P` process/API/import | ~constant | 28.9 / 20.6 | 24.9 / 17.5 |
+| `W` weight load | bytes ÷ read BW | 5.4 / 2.8 | 5.5 / 5.5 |
+| `C` torch.compile | **layers/structure** | 23.8 / 0.5 | 8.4 / 0.1 |
+| `G` CUDA graph capture | **layers × capture sizes** | 14.0 / 13.0 | 11.0 / 9.0 |
+| `U` kernel warmup/autotune | kernel set | 60.4 / 3.1 | 58.9 / 4.4 |
+
+Weight read is I/O- and format-dependent: bf16 ~2.0 GiB/s cold (disk) vs
+~7.3 GiB/s warm (page cache); 4-bit GPTQ ~2.9 GiB/s (dequant bound). Cold is
+dominated by `C+G+U`; warm still re-pays `W` and `G`; snapshot removes them all.
+
+Projections: 80 GB card (u=0.9) → S≈75 GB → ~37 s; 500B-class 4-bit capped →
+S≈275 GB (weights-dominated) → ~135 s, the case Phase 9 targets.
+
+---
+
+## 2. Install
+
+Tested on Ubuntu 22.04, 1× NVIDIA GPU (driver ≥ 570; here 580.178.04).
+
+```bash
+# 1. Clone the fork/branch
+git clone git@github.com:eliird/vllm-personal.git
+cd vllm-personal
+git checkout feat/checkpoint-restore
+
+# 2. Python env + vLLM (precompiled wheel; no local vLLM build)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv --python 3.12 .venv
+VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+
+# 3. CUDA toolkit (nvcc; needed for JIT warmup and the .cu probes)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
+sudo apt-get install -y --no-install-recommends cuda-toolkit-13-2
+
+# 4. CRIU >= 4.0 + CUDA plugin (from source; apt CRIU is too old for the plugin)
+sudo apt-get install -y build-essential pkg-config protobuf-c-compiler \
+  libprotobuf-c-dev libprotobuf-dev protobuf-compiler libnl-3-dev \
+  libnl-route-3-dev libnet1-dev libcap-dev python3-protobuf libbsd-dev \
+  uuid-dev libaio-dev iproute2
+git clone https://github.com/checkpoint-restore/criu.git /tmp/criu
+( cd /tmp/criu && make -j"$(nproc)" all && \
+  sudo make install-lib install-crit install-criu install-compel install-cuda_plugin && \
+  sudo install -m 0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so )
+# (plain `make install` also builds man pages, which needs asciidoc)
+
+# 5. cuda-checkpoint (NVIDIA ships a prebuilt binary)
+git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
+sudo install -m 0755 /tmp/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/local/bin/cuda-checkpoint
+
+# 6. Model
+.venv/bin/hf download Qwen/Qwen3-4B
+```
+
+Verify:
+
+```bash
+nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv
+criu --version && ls /usr/lib/criu/cuda_plugin.so
+cuda-checkpoint --help 2>&1 | head -2
+.venv/bin/python -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
+```
+
+---
+
+## 3. Reproduce the 3 runs (Qwen3-4B)
+
+Workflow: cold (no compile cache) → warm (cache reused) → snapshot → restore.
+All commands run from the repo root; UIs/plots land in `snapshot/plots/` (gitignored).
+
+```bash
+# Run 1 — cold start (clears ~/.cache/vllm, torch/inductor, triton, flashinfer)
+MODEL=Qwen/Qwen3-4B PORT=8400 TAG=qwen3_4b_cold CLEAR_CACHE=1 \
+  MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
+  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_cold.log
+
+# Run 2 — warm start (reuse the compile cache)
+MODEL=Qwen/Qwen3-4B PORT=8401 TAG=qwen3_4b_warm CLEAR_CACHE=0 \
+  MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
+  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_warm.log
+
+# Run 3a — snapshot a warm worker (clean /dev/shm BEFORE the snapshot)
+echo irdali | sudo -S -p '' rm -f /dev/shm/link_remap.* /dev/shm/sem.*
+echo irdali | sudo -S -p '' bash -c '
+  timeout 900 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
+    IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
+    bash snapshot/scripts/p4_snapshot_vllm.sh' 2>&1 | tee snapshot/logs/run_snapshot.log
+
+# Run 3b — restore and verify one inference (do NOT touch /dev/shm first)
+echo irdali | sudo -S -p '' bash -c '
+  timeout 600 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
+    IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
+    bash snapshot/scripts/p4_restore_vllm.sh' 2>&1 | tee snapshot/logs/run_restore.log
+
+# Plot cold vs warm vs restore
+.venv/bin/python snapshot/scripts/p1_visualize_breakdown.py \
+  --cold-log snapshot/logs/p1_qwen3_4b_cold_vllm.log \
+  --warm-log snapshot/logs/p1_qwen3_4b_warm_vllm.log \
+  --restore-json snapshot/logs/p4_qwen3_4b_restore_times.json \
+  --label Qwen3-4B --out snapshot/plots/startup_breakdown_qwen3_4b.png
+```
+
+Swapping `MODEL`/`TAG` gives the MoE run
+(`Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4`, port 8420). Full runbook details
+(caveats, cleanup, expected values) are in the issue list below.
+
+### Layout
+
+| Path | Purpose |
+| --- | --- |
+| `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh` |
+| `scripts/dev/` | one-off/test probes (gitignored) |
+| `results/` | `stack.txt`, `verification/` |
+| `logs/`, `plots/` | run outputs (gitignored) |
+| `images/` | figures embedded in this README (tracked) |
+
+---
+
+## 4. Open issues and roadmap
+
+### 4.1 `/dev/shm` link-remap makes snapshots one-shot  *(known blocker)*
+vLLM's engine runs in a Python multiprocessing child; CPython creates POSIX
+semaphores `/dev/shm/sem.mp-*` (hard-linked twice). CRIU needs `--link-remap`,
+but the `link_remap.*` temp is **not stored in the image**, so the first restore
+consumes it and later restores fail:
+`Can't link dev/shm/link_remap.N -> dev/shm/sem.X: No such file or directory`.
+- Workaround: clean `/dev/shm` before snapshot, restore once, re-snapshot.
+- Planned fix: **patch CRIU** (on a branch) to store/recreate the link-remap temp
+  from the image, making snapshots reusable. (Running vLLM single-process
+  `VLLM_ENABLE_V1_MULTIPROCESSING=0` avoids the semaphores but costs performance.)
+
+### 4.2 Image size = full device state  *(optimization)*
+Images (~17 GB) capture the entire GPU footprint, dominated by the **idle KV
+cache** (Qwen1.5B was 10 GB of KV) and the weights.
+- **KV discard / offload** before snapshot (vLLM `sleep`, Phase 6/7) instead of
+  capturing full state → restore ~8.5 s → ~5–6 s.
+- **Weight separation** (Phase 9): keep weights out of the image entirely for the
+  large-model regime (~270 GB of weights is otherwise the whole image).
+
+### 4.3 Correctness hardening
+Beyond one correct response: repeated restores (once images are reusable) and a
+**soak test** (many requests after restore, exercising fresh KV allocation and
+graph replay). Fold into Phase 6/7 verification.
+
+### 4.4 Remaining phases
+| Phase | Status |
+| --- | --- |
+| 0a/0b stack + CUDA round-trip | done, verified |
+| 1 cold/warm decomposition | done (Qwen3-4B + MoE) |
+| 2 CRIU characterization | done, verified |
+| 3 cuda-checkpoint characterization | done, verified |
+| 4 snapshot/restore (unoptimized) | done for both models; hardening pending |
+| 5 quiesce lifecycle + thin `snapshot-manager` CLI | not started |
+| 6+7 sleep / KV discard | not started (largest win) |
+| 8 restore profiling, lazy-pages, parallel I/O | not started |
+| 9 weight separation | optional here; essential at scale |
+| 10 multi-GPU / TP-EP | N/A (single GPU) |
+| 11 production manager (create/list/restore/delete, driver guard) | not started |
+
+### 4.5 Scale / production
+- **Kubernetes**: this is non-K8s today. At scale we need a per-Pod sidecar/manager
+  that drives quiesce → snapshot → restore, with restores pinned to compatible
+  drivers/GPUs. Snapshots are **ephemeral across driver upgrades** (hard-fail on
+  mismatch).
+- Driver/CRIU/plugin versions move quickly; pin the stack and re-validate.
+
+### 4.6 Smaller caveats
+- `UV_USE_IO_URING=0` is required (CRIU cannot dump uvloop's `io_uring`).
+- Do not mix integration modes: plugin (CRIU drives `cuda-checkpoint`) vs manual
+  `--toggle` (must use an empty `--libdir`).
+- Dump/restore I/O is high-variance (16 GiB dump: 9–144 s); weight load is
+  page-cache dependent.
+- The `cuda_plugin ... restore tid` lines for non-CUDA helpers are harmless noise.

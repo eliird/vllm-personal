@@ -1,8 +1,8 @@
 # vLLM Snapshot/Restore — Phase Report
 
-Narrative per-phase results. Raw evidence: `results/RESULTS.md`, `logs/`,
-`results/verification/`. Each phase is executed and then independently verified
-by a separate subagent whose verdict lands in `results/verification/phase-NN.md`.
+Narrative per-phase results. Raw evidence: `snapshot/README.md`, `snapshot/logs/`,
+`snapshot/results/verification/`. Each phase is executed and then independently verified
+by a separate subagent whose verdict lands in `snapshot/results/verification/phase-NN.md`.
 
 Host: `yuya-sakamoto` — Ubuntu 22.04.5, kernel 6.8.0-138, **1× RTX 4060 Ti 16 GB
 (sm_89)**, driver 580.178.04, CRIU 4.2.1 + CUDA plugin, `cuda-checkpoint`
@@ -36,7 +36,7 @@ wheel; `.venv` Python 3.12).
 - Deviations: `nvcc` absent → torch-equivalent CUDA program added; plugin logs
   "Failed to launch cuda-checkpoint to retrieve restore tid" even for non-CUDA
   processes (harmless here).
-- Verdict: `results/verification/phase-00a.md` (Overall PASS).
+- Verdict: `snapshot/results/verification/phase-00a.md` (Overall PASS).
 
 ## Phase 0b — Minimal CUDA checkpoint/kill/restore round-trip — **PASS** (verified)
 
@@ -52,15 +52,15 @@ wheel; `.venv` Python 3.12).
   now uses an empty `--libdir`. **Never mix modes.**
 - Verifier reproduced everything incl. negative control (plain kill resets the
   counter) and independently observed the suspend removing GPU usage.
-- Verdict: `results/verification/phase-00b.md` (Overall PASS).
+- Verdict: `snapshot/results/verification/phase-00b.md` (Overall PASS).
 
 ## Phase 1 — Cold vs warm startup decomposition — **PASS** (verified)
 
 Measured three ways per model: cold (vLLM + torch/inductor compile cache
 cleared), warm (compile cache reused), and (later, Phase 4/5) snapshot restore.
 Weights are pre-fetched into the HF cache before timing and any HF **download**
-is reported separately (`results/startup_breakdown.md`); it is network transfer
-and must not be counted as weight load. Timeline: `results/startup_timeline.png`.
+is reported separately; it is network transfer and must not be counted as
+weight load. Timeline: `snapshot/plots/startup_timeline.png`.
 
 - **gpt-oss-20b** (MoE; needs `--cpu-offload-gb 6` + `--enforce-eager` to fit
   16 GB; Marlin MXFP4 on Ada): cold ready **104.3 s**, warm ready **43.0 s**.
@@ -76,7 +76,7 @@ and must not be counted as weight load. Timeline: `results/startup_timeline.png`
   CRIU + `cuda-checkpoint` snapshot has a large guaranteed win. Phase 9 (weight
   separation) is **optional** here, though a naive snapshot still moves the
   weight bytes (read + repack) through disk.
-- Verdict: `results/verification/phase-01.md`.
+- Verdict: `snapshot/results/verification/phase-01.md`.
 
 ## Phase 2 — CRIU characterization (CPU) — **PASS** (verified)
 
@@ -91,8 +91,8 @@ and must not be counted as weight load. Timeline: `results/startup_timeline.png`
   exist at restore.
 - Probe bug found and fixed: original `p2_ram.c` included the embedded counter
   in the checksum; checksum now skips `buf[0]` (verifier confirmed
-  `scripts/p2_ram.c:26`).
-- Verdict: `results/verification/phase-02.md` (Overall PASS).
+  `snapshot/scripts/dev/p2_ram.c:26`).
+- Verdict: `snapshot/results/verification/phase-02.md` (Overall PASS).
 
 
 
@@ -109,3 +109,19 @@ and must not be counted as weight load. Timeline: `results/startup_timeline.png`
 - Fixes: device-buffer counter (not `__device__` global) fixes a
   `cuda-checkpoint` illegal-access error; integer checksum removes float
   non-determinism; chunked torch pattern avoids allocator bloat.
+
+## Revised model set and Phase 4 results (device-resident)
+
+`gpt-oss-20b` is excluded (13.8 GB MXFP4 does not fit 16 GB without offload).
+Workloads are now `Qwen/Qwen3-4B` (dense bf16, 7.56 GiB) and
+`Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4` (4-bit MoE, 7.91 GiB).
+
+- **Phase 1:** cold/warm ready — Qwen3-4B 130.5 → 40.5 s; MoE 108.8 → 36.4 s.
+  Compile/warmup dominates cold and is cached; weight load and ~9–13 s of CUDA
+  graph capture survive into warm.
+- **Phase 4:** snapshot→restore→correct inference — Qwen3-4B **8.44 s**
+  (4.8× vs warm, 15.5× vs cold); MoE **8.58 s** (4.2× / 12.7×). Images ≈ 17 GB
+  each (device footprint + host, includes idle KV).
+- Plots: `snapshot/plots/startup_breakdown_{qwen3_4b,moe}.png`.
+- Blocker: `/dev/shm` link-remap is one-shot (clean before snapshot, re-snapshot
+  for another restore).
