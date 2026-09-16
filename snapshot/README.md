@@ -85,30 +85,36 @@ S≈275 GB (weights-dominated) → ~135 s, the case Phase 9 targets.
 
 ## 2. Install
 
+This repo is standalone. It pairs with a pinned **vLLM checkout**, located via the
+`VLLM_HOME` environment variable (which provides the `.venv` the scripts call).
 Tested on Ubuntu 22.04, 1× NVIDIA GPU (driver ≥ 570; here 580.178.04).
 
 ```bash
-# 1. Clone the fork/branch
+# 1. Clone this repo and the pinned vLLM fork side by side, then point VLLM_HOME at it
+git clone git@github.com:eliird/vllm-snapshot.git
 git clone git@github.com:eliird/vllm-personal.git
-cd vllm-personal
-git checkout feat/checkpoint-restore
+cd vllm-snapshot
+export VLLM_HOME="$(cd ../vllm-personal && pwd)"     # add to ~/.bashrc to persist
 
-# 2. Python env + vLLM (precompiled wheel; no local vLLM build)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv --python 3.12 .venv
-VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
+# 2. vLLM env in $VLLM_HOME (precompiled wheel; no local vLLM build). See vllm.lock.
+( cd "$VLLM_HOME"
+  git checkout feat/checkpoint-restore
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv venv --python 3.12 .venv
+  VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto )
 
-# 3. CUDA toolkit (nvcc; needed for JIT warmup and the .cu probes)
+# 3. CUDA toolkit (nvcc; needed for JIT warmup)
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
 sudo apt-get install -y --no-install-recommends cuda-toolkit-13-2
 
-# 4. CRIU >= 4.0 + CUDA plugin (from source; apt CRIU is too old for the plugin)
+# 4. CRIU >= 4.0 + CUDA plugin. Use the fork that carries the link-remap reuse fix;
+#    alternatively apply patches/criu-link-remap-reusable.patch to upstream CRIU.
 sudo apt-get install -y build-essential pkg-config protobuf-c-compiler \
   libprotobuf-c-dev libprotobuf-dev protobuf-compiler libnl-3-dev \
   libnl-route-3-dev libnet1-dev libcap-dev python3-protobuf libbsd-dev \
   uuid-dev libaio-dev iproute2
-git clone https://github.com/checkpoint-restore/criu.git /tmp/criu
+git clone git@github.com:eliird/CRIU-multiprocess.git /tmp/criu
 ( cd /tmp/criu && make -j"$(nproc)" all && \
   sudo make install-lib install-crit install-criu install-compel install-cuda_plugin && \
   sudo install -m 0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so )
@@ -118,61 +124,60 @@ git clone https://github.com/checkpoint-restore/criu.git /tmp/criu
 git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 sudo install -m 0755 /tmp/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/local/bin/cuda-checkpoint
 
-# 6. Model
-.venv/bin/hf download Qwen/Qwen3-4B
+# 6. Model (download using the vLLM venv)
+"$VLLM_HOME/.venv/bin/hf" download Qwen/Qwen3-4B
 ```
 
-Verify:
+Verify (with `VLLM_HOME` set):
 
 ```bash
 nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv
 criu --version && ls /usr/lib/criu/cuda_plugin.so
 cuda-checkpoint --help 2>&1 | head -2
-.venv/bin/python -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
+"$VLLM_HOME/.venv/bin/python" -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
 ```
 
-> This repo is standalone: the scripts find the vLLM checkout (and its `.venv`)
-> via `VLLM_HOME`, defaulting to the **parent directory**. Point it elsewhere with
-> `export VLLM_HOME=/path/to/vllm-personal`. The pinned vLLM commit/wheel is in
-> [`vllm.lock`](vllm.lock).
+> `VLLM_HOME` **defaults to this repo's parent directory**, so a side-by-side
+> `vllm-personal/` checkout needs no setting. The scripts use `VLLM_HOME` only for
+> the vLLM binary/venv; run outputs (`logs/`, `plots/`, `snapshots/`) stay in this
+> repo. Pinned vLLM commit/wheel: [`vllm.lock`](vllm.lock).
 
 ---
 
 ## 3. Reproduce the 3 runs (Qwen3-4B)
 
 Workflow: cold (no compile cache) → warm (cache reused) → snapshot → restore.
-All commands run from the repo root; UIs/plots land in `snapshot/plots/` (gitignored).
+Run all commands **from this repo's root** (`VLLM_HOME` set). Outputs land in
+`logs/` and `plots/` (both gitignored). Snapshot/restore steps need root.
 
 ```bash
 # Run 1 — cold start (clears ~/.cache/vllm, torch/inductor, triton, flashinfer)
 MODEL=Qwen/Qwen3-4B PORT=8400 TAG=qwen3_4b_cold CLEAR_CACHE=1 \
   MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_cold.log
+  bash scripts/p1_baseline.sh 2>&1 | tee logs/run_cold.log
 
 # Run 2 — warm start (reuse the compile cache)
 MODEL=Qwen/Qwen3-4B PORT=8401 TAG=qwen3_4b_warm CLEAR_CACHE=0 \
   MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_warm.log
+  bash scripts/p1_baseline.sh 2>&1 | tee logs/run_warm.log
 
 # Run 3a — snapshot a warm worker (clean /dev/shm BEFORE the snapshot)
-echo irdali | sudo -S -p '' rm -f /dev/shm/link_remap.* /dev/shm/sem.*
-echo irdali | sudo -S -p '' bash -c '
-  timeout 900 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
-    IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-    bash snapshot/scripts/p4_snapshot_vllm.sh' 2>&1 | tee snapshot/logs/run_snapshot.log
+sudo rm -f /dev/shm/link_remap.* /dev/shm/sem.*
+sudo env VLLM_HOME="$VLLM_HOME" MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
+  MODE=plugin IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
+  timeout 900 bash scripts/p4_snapshot_vllm.sh 2>&1 | tee logs/run_snapshot.log
 
 # Run 3b — restore and verify one inference (do NOT touch /dev/shm first)
-echo irdali | sudo -S -p '' bash -c '
-  timeout 600 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
-    IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
-    bash snapshot/scripts/p4_restore_vllm.sh' 2>&1 | tee snapshot/logs/run_restore.log
+sudo env VLLM_HOME="$VLLM_HOME" MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
+  MODE=plugin IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
+  timeout 600 bash scripts/p4_restore_vllm.sh 2>&1 | tee logs/run_restore.log
 
 # Plot cold vs warm vs restore
-.venv/bin/python snapshot/scripts/p1_visualize_breakdown.py \
-  --cold-log snapshot/logs/p1_qwen3_4b_cold_vllm.log \
-  --warm-log snapshot/logs/p1_qwen3_4b_warm_vllm.log \
-  --restore-json snapshot/logs/p4_qwen3_4b_restore_times.json \
-  --label Qwen3-4B --out snapshot/plots/startup_breakdown_qwen3_4b.png
+"$VLLM_HOME/.venv/bin/python" scripts/p1_visualize_breakdown.py \
+  --cold-log logs/p1_qwen3_4b_cold_vllm.log \
+  --warm-log logs/p1_qwen3_4b_warm_vllm.log \
+  --restore-json logs/p4_qwen3_4b_restore_times.json \
+  --label Qwen3-4B --out plots/startup_breakdown_qwen3_4b.png
 ```
 
 Swapping `MODEL`/`TAG` gives the MoE run
@@ -183,11 +188,13 @@ Swapping `MODEL`/`TAG` gives the MoE run
 
 | Path | Purpose |
 | --- | --- |
-| `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh` |
+| `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh`, `p6_sleep_test.sh`, `snapshot-manager` |
 | `scripts/dev/` | one-off/test probes (gitignored) |
+| `patches/` | `criu-link-remap-reusable.patch` (also in the CRIU fork) |
 | `results/` | `stack.txt`, `verification/` |
-| `logs/`, `plots/` | run outputs (gitignored) |
 | `images/` | figures embedded in this README (tracked) |
+| `vllm.lock` | pinned vLLM commit/wheel (pair with `VLLM_HOME`) |
+| `logs/`, `plots/`, `snapshots/` | run outputs (gitignored) |
 
 ---
 
@@ -309,16 +316,19 @@ graph replay). Fold into Phase 6/7 verification.
 
 ```bash
 # create from an already-running worker (quiesce via /sleep, then CRIU dump)
-sudo .venv/bin/python snapshot/scripts/snapshot-manager create <name> \
+sudo env VLLM_HOME="$VLLM_HOME" "$VLLM_HOME/.venv/bin/python" \
+  scripts/snapshot-manager create <name> \
   --pid <vllm-pid> --port <port> --model Qwen/Qwen3-4B --sleep 1
-.venv/bin/python snapshot/scripts/snapshot-manager list
-.venv/bin/python snapshot/scripts/snapshot-manager status <name>
-sudo .venv/bin/python snapshot/scripts/snapshot-manager restore <name> --port <port>
-.venv/bin/python snapshot/scripts/snapshot-manager delete <name>
+"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager list
+"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager status <name>
+sudo env VLLM_HOME="$VLLM_HOME" "$VLLM_HOME/.venv/bin/python" \
+  scripts/snapshot-manager restore <name> --port <port>
+"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager delete <name>
 ```
-Verified end-to-end: create (14.6 GB) → restore → correct inference → delete. A
-driver/GPU/CUDA mismatch on restore is **refused** (exit 2), so snapshots are
-documented as ephemeral across driver upgrades.
+Snapshots live in `snapshots/<name>/` in this repo (gitignored); `create`/`restore`
+need root for CRIU. Verified end-to-end: create (14.6 GB) → restore → correct
+inference → delete. A driver/GPU/CUDA mismatch on restore is **refused** (exit 2),
+so snapshots are documented as ephemeral across driver upgrades.
 
 ### 5.5 Scale / production
 - **Kubernetes**: this is non-K8s today. At scale we need a per-Pod sidecar/manager
