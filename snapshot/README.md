@@ -91,10 +91,13 @@ vLLM source tree. Tested on Ubuntu 22.04, 1× NVIDIA GPU (driver ≥ 570; here
 580.178.04).
 
 ```bash
-# 1. vLLM in this repo's venv (precompiled wheel; no local build)
+# 1. vLLM in this repo's venv — pinned to the precompiled build tested here
+#    (commit 8263ea12bd, cu130; no local build)
 uv venv --python 3.12 .venv          # or: python3 -m venv .venv
 source .venv/bin/activate
-VLLM_USE_PRECOMPILED=1 uv pip install vllm --torch-backend=auto
+uv pip install "vllm==0.29.1rc1.dev134+g8263ea12b" \
+  --extra-index-url https://wheels.vllm.ai/8263ea12bd8fa7584277f5200d521193259707b7/cu130/ \
+  --torch-backend=auto
 # The scripts auto-detect this repo's .venv. If vLLM is installed elsewhere,
 # export VLLM_HOME=/dir/containing/.venv (and pass it through sudo for dumps).
 

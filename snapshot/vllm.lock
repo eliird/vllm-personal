@@ -1,11 +1,16 @@
-# vLLM dependency pin for the snapshot work
+# vLLM dependency pin for this repo — install the exact build we tested.
 #
-# The scripts use VLLM_HOME (default: the parent directory) to find the vLLM
-# checkout and its .venv. Point it at a checkout of:
-repo:        git@github.com:eliird/vllm-personal.git
-branch:      feat/checkpoint-restore
-commit:      7d88354c14
-base_commit: 8263ea12bd   # upstream commit the precompiled wheel is built for
-vllm:        0.29.1rc1.dev135+g39651f804.precompiled
-wheel:       VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cu130
-python:      3.12
+# Precompiled wheel for upstream commit 8263ea12bd (CUDA 13.0 variant "cu130").
+# No local build: this is the artifact the scripts inline-install below.
+#
+#   uv pip install "vllm==0.29.1rc1.dev134+g8263ea12b" \
+#     --extra-index-url https://wheels.vllm.ai/8263ea12bd8fa7584277f5200d521193259707b7/cu130/ \
+#     --torch-backend=auto
+#
+vllm:            0.29.1rc1.dev134+g8263ea12b
+upstream_commit: 8263ea12bd8fa7584277f5200d521193259707b7
+variant:         cu130
+index:           https://wheels.vllm.ai/8263ea12bd8fa7584277f5200d521193259707b7/cu130/
+wheel:           vllm-0.29.1rc1.dev134+g8263ea12b-cp38-abi3-manylinux_2_28_x86_64.whl
+torch:           2.13.0+cu132
+python:          3.12
