@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Phase 4: start a warm vLLM worker, quiesce, and checkpoint it with CRIU +
-# cuda-checkpoint. Leaves images for scripts/p4_restore_vllm.sh.
+# cuda-checkpoint. Leaves images for snapshot/scripts/p4_restore_vllm.sh.
 #
 # Env:
 #   MODEL   PORT=8000   TAG=small   MODE=plugin|manual
 #   IMG=/tmp/p4_snap   EXTRA_ARGS="..."   MAX_MODEL_LEN=4096   GPU_MEM_UTIL=0.90
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+SNAP="$(cd "$(dirname "$0")/.." && pwd)"   # snapshot/
+ROOT="$(cd "$SNAP/.." && pwd)"             # repo root (holds .venv/)
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8000}"
@@ -18,7 +19,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 PROMPT="${PROMPT:-The capital of France is}"
 
-LOGDIR="${LOGDIR:-logs}"; mkdir -p "$LOGDIR"
+LOGDIR="${LOGDIR:-$SNAP/logs}"; mkdir -p "$LOGDIR"
 VLOG="$LOGDIR/p4_${TAG}_vllm.log"
 rm -rf "$IMG"; mkdir -p "$IMG/plugins"
 : > "$VLOG"
@@ -34,7 +35,7 @@ echo "launch: vllm serve $MODEL --port $PORT (mode=$MODE)" | tee -a "$VLOG"
 # Log to a regular file (not a FIFO): CRIU must be able to reopen stdout on
 # restore, and a deleted FIFO breaks restore.
 # shellcheck disable=SC2086
-setsid env UV_USE_IO_URING=0 PYTHONUNBUFFERED=1 .venv/bin/vllm serve "$MODEL" --port "$PORT" \
+setsid env UV_USE_IO_URING=0 PYTHONUNBUFFERED=1 "$ROOT/.venv/bin/vllm" serve "$MODEL" --port "$PORT" \
   --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" \
   $EXTRA_ARGS >> "$VLOG" 2>&1 &
 SRV=$!

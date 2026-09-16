@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Phase 4: restore a vLLM worker checkpointed by scripts/p4_snapshot_vllm.sh and
+# Phase 4: restore a vLLM worker checkpointed by snapshot/scripts/p4_snapshot_vllm.sh and
 # verify one correct inference. Measures restore -> ready and restore -> first
 # response.
 #
 # Env: MODEL  PORT=8000  TAG=small  MODE=plugin|manual  IMG=/tmp/p4_snap_<tag>
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+SNAP="$(cd "$(dirname "$0")/.." && pwd)"   # snapshot/
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8000}"
@@ -15,7 +15,7 @@ IMG="${IMG:-/tmp/p4_snap_$TAG}"
 PROMPT="${PROMPT:-The capital of France is}"
 EXPECT="${EXPECT:-Paris}"
 
-LOGDIR="${LOGDIR:-logs}"; mkdir -p "$LOGDIR"
+LOGDIR="${LOGDIR:-$SNAP/logs}"; mkdir -p "$LOGDIR"
 if [ "$(id -u)" -eq 0 ]; then SUDO_CRIU=""; else SUDO_CRIU="sudo"; fi
 LIBDIR_ARGS=()
 if [ "$MODE" = "manual" ]; then LIBDIR_ARGS=(--libdir "$IMG/plugins"); fi

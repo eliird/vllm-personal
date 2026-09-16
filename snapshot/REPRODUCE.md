@@ -2,12 +2,18 @@
 
 Follow-along runbook for the headline experiment. You will produce:
 
-1. **Cold start** — no kernel/compile cache (download already done, so excluded).
+1. **Cold start** — no kernel/compile cache (HF download prefetched and excluded).
 2. **Warm start** — compile/autotune cache reused.
 3. **Snapshot restore** — `criu dump` a warm worker, `criu restore` it, and get a
    correct inference.
 
-Then parse the logs and render the 3-timeline figure.
+Then render the plot of how long each startup takes.
+
+All work lives under `snapshot/`:
+- scripts: `snapshot/scripts/`
+- logs (gitignored): `snapshot/logs/`
+- plots (gitignored): `snapshot/plots/`
+- deliverables: `snapshot/results/`
 
 Metric: **start restore → first correct inference response.**
 
@@ -22,7 +28,7 @@ Metric: **start restore → first correct inference response.**
 | `criu` | 4.2.1 at `/usr/local/sbin/criu` + `/usr/lib/criu/cuda_plugin.so` |
 | `cuda-checkpoint` | 580.178.04 at `/usr/local/bin/cuda-checkpoint` |
 | `nvcc` | 13.2 at `/usr/local/cuda/bin/nvcc` |
-| venv | `.venv` (Python 3.12), vLLM editable precompiled |
+| venv | `.venv` (Python 3.12) at the repo root, vLLM editable precompiled |
 | model | `Qwen/Qwen3-4B` cached in `~/.cache/huggingface` |
 
 Sanity + free the GPU and `/dev/shm`:
@@ -47,19 +53,20 @@ done
 cd ~/work/vllm-personal
 MODEL=Qwen/Qwen3-4B PORT=8400 TAG=qwen3_4b_cold \
   CLEAR_CACHE=1 MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-  bash scripts/p1_baseline.sh 2>&1 | tee logs/run_cold.log
+  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_cold.log
 ```
 
 `CLEAR_CACHE=1` wipes `~/.cache/vllm`, `~/.cache/torch/inductor`,
-`~/.cache/triton`, `~/.cache/flashinfer`.
+`~/.cache/triton`, `~/.cache/flashinfer`. `PRELOAD=1` (default) prefetches the
+HF weights before T0, so "cold" means compile-cache-cold, not first fetch.
 
 Expected (measured): **T0→ready ≈ 130 s**, of which `init engine` ≈ 98 s
 (`torch.compile` ≈ 24 s, CUDA graph capture ≈ 14 s).
 
-Key lines to look for:
+Key lines:
 
 ```bash
-grep -E "T0->|init engine|torch.compile|Graph capturing|Available KV cache" logs/p1_qwen3_4b_cold_vllm.log
+grep -E "T0->|init engine|torch.compile|Graph capturing|Available KV cache" snapshot/logs/p1_qwen3_4b_cold_vllm.log
 ```
 
 ---
@@ -72,7 +79,7 @@ Start it **without** clearing caches, so the AOT compile cache is reused:
 cd ~/work/vllm-personal
 MODEL=Qwen/Qwen3-4B PORT=8401 TAG=qwen3_4b_warm \
   CLEAR_CACHE=0 MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-  bash scripts/p1_baseline.sh 2>&1 | tee logs/run_warm.log
+  bash snapshot/scripts/p1_baseline.sh 2>&1 | tee snapshot/logs/run_warm.log
 ```
 
 Expected (measured): **T0→ready ≈ 40 s**, `torch.compile` ≈ 0.1 s (cached),
@@ -96,7 +103,7 @@ echo irdali | sudo -S -p '' rm -f /dev/shm/link_remap.* /dev/shm/sem.*
 echo irdali | sudo -S -p '' bash -c '
   timeout 900 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
     IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
-    bash scripts/p4_snapshot_vllm.sh' 2>&1 | tee logs/run_snapshot.log
+    bash snapshot/scripts/p4_snapshot_vllm.sh' 2>&1 | tee snapshot/logs/run_snapshot.log
 ```
 
 The script starts vLLM, warms one request, then runs (plugin mode, so the CRIU
@@ -112,12 +119,6 @@ mappings).
 Expected (measured): **dump ≈ 15 s**, image **≈ 17–18 GB** (includes the KV
 cache), and the dumped process is terminated by the dump.
 
-Check `/dev/shm` now shows a `link_remap.*` and a `sem.*`:
-
-```bash
-ls -la /dev/shm/
-```
-
 ### 3b. Restore and verify one inference
 
 Do **not** touch `/dev/shm` first.
@@ -127,36 +128,38 @@ cd ~/work/vllm-personal
 echo irdali | sudo -S -p '' bash -c '
   timeout 600 env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b MODE=plugin \
     IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
-    bash scripts/p4_restore_vllm.sh' 2>&1 | tee logs/run_restore.log
+    bash snapshot/scripts/p4_restore_vllm.sh' 2>&1 | tee snapshot/logs/run_restore.log
 ```
 
 Expected (measured): **restore → first response ≈ 8.4 s**, and a response
 containing `Paris` (e.g. `" Paris. The capital of Germany is Berlin"`), i.e.
 `PASS: response contains 'Paris'`. The restore script also writes
-`logs/p4_qwen3_4b_restore_times.json`.
+`snapshot/logs/p4_qwen3_4b_restore_times.json`.
 
 ---
 
-## 4. Parse the breakdown and render the figure
+## 4. Render the startup plot
 
 ```bash
 cd ~/work/vllm-personal
-
-# table over all logs (old + new)
-.venv/bin/python scripts/p1_parse_breakdown.py \
-  --markdown results/startup_breakdown.md \
-  'logs/p1_qwen3_4b_*_vllm.log'
-
-# three-timeline figure
-.venv/bin/python scripts/p1_visualize_breakdown.py \
-  --cold-log logs/p1_qwen3_4b_cold_vllm.log \
-  --warm-log logs/p1_qwen3_4b_warm_vllm.log \
-  --restore-json logs/p4_qwen3_4b_restore_times.json \
+.venv/bin/python snapshot/scripts/p1_visualize_breakdown.py \
+  --cold-log snapshot/logs/p1_qwen3_4b_cold_vllm.log \
+  --warm-log snapshot/logs/p1_qwen3_4b_warm_vllm.log \
+  --restore-json snapshot/logs/p4_qwen3_4b_restore_times.json \
   --label Qwen3-4B \
-  --out results/startup_breakdown_qwen3_4b.png
+  --out snapshot/plots/startup_breakdown_qwen3_4b.png
 ```
 
-Output: `results/startup_breakdown_qwen3_4b.png` (open it in an image viewer).
+Output: `snapshot/plots/startup_breakdown_qwen3_4b.png` — three stacked timelines
+(cold / warm / restore) showing where the startup time goes.
+
+Optional: a per-run timeline over all logs (also prints a table to stdout):
+
+```bash
+.venv/bin/python snapshot/scripts/p1_parse_breakdown.py \
+  --plot snapshot/plots/startup_timeline.png \
+  'snapshot/logs/p1_*_vllm.log'
+```
 
 ---
 

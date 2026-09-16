@@ -3,15 +3,15 @@
 matplotlib image, with the component breakdown stacked along the time axis.
 
 Cold and warm are parsed from vLLM logs by p1_parse_breakdown; the restore row
-comes from the JSON written by scripts/p4_restore_vllm.sh.
+comes from the JSON written by snapshot/scripts/p4_restore_vllm.sh.
 
 Usage:
-    .venv/bin/python scripts/p1_visualize_breakdown.py \
-        --cold-log  logs/p1_qwen3_4b_cold_vllm.log \
-        --warm-log  logs/p1_qwen3_4b_warm_vllm.log \
-        --restore-json logs/p4_qwen3_4b_restore_times.json \
+    python snapshot/scripts/p1_visualize_breakdown.py \
+        --cold-log  snapshot/logs/p1_qwen3_4b_cold_vllm.log \
+        --warm-log  snapshot/logs/p1_qwen3_4b_warm_vllm.log \
+        --restore-json snapshot/logs/p4_qwen3_4b_restore_times.json \
         --label Qwen3-4B \
-        --out results/startup_breakdown_qwen3_4b.png
+        --out snapshot/plots/startup_breakdown_qwen3_4b.png
 """
 from __future__ import annotations
 
