@@ -148,24 +148,33 @@ Workflow: cold (no compile cache) → warm (cache reused) → snapshot → resto
 Run all commands **from this repo's root**, with the venv active. Outputs land in
 `logs/` and `plots/` (both gitignored). Snapshot/restore steps need root.
 
+> **Before every run, stop any previously-running vLLM engine** (and any hung
+> `criu restore`): `bash scripts/stop_vllm.sh [--shm] [PORT...]`. A leftover
+> restored worker holds the port/GPU and makes the next `criu restore` fail with
+> `Can't fork for <pid>: File exists`. Use `--shm` **only before a snapshot**
+> (never between dump and restore).
+
 ```bash
 # Run 1 — cold start (clears ~/.cache/vllm, torch/inductor, triton, flashinfer)
+bash scripts/stop_vllm.sh 8400
 MODEL=Qwen/Qwen3-4B PORT=8400 TAG=qwen3_4b_cold CLEAR_CACHE=1 \
   MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
   bash scripts/p1_baseline.sh 2>&1 | tee logs/run_cold.log
 
 # Run 2 — warm start (reuse the compile cache)
+bash scripts/stop_vllm.sh 8401
 MODEL=Qwen/Qwen3-4B PORT=8401 TAG=qwen3_4b_warm CLEAR_CACHE=0 \
   MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
   bash scripts/p1_baseline.sh 2>&1 | tee logs/run_warm.log
 
-# Run 3a — snapshot a warm worker (clean /dev/shm BEFORE the snapshot)
-sudo rm -f /dev/shm/link_remap.* /dev/shm/sem.*
+# Run 3a — snapshot a warm worker (--shm cleans /dev/shm BEFORE the snapshot)
+bash scripts/stop_vllm.sh --shm 8411
 sudo env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
   MODE=plugin IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
   timeout 900 bash scripts/p4_snapshot_vllm.sh 2>&1 | tee logs/run_snapshot.log
 
-# Run 3b — restore and verify one inference (do NOT touch /dev/shm first)
+# Run 3b — restore and verify one inference (do NOT clean /dev/shm here)
+bash scripts/stop_vllm.sh 8411
 sudo env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
   MODE=plugin IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
   timeout 600 bash scripts/p4_restore_vllm.sh 2>&1 | tee logs/run_restore.log
@@ -178,6 +187,9 @@ sudo env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
   --label Qwen3-4B --out plots/startup_breakdown_qwen3_4b.png
 ```
 
+For the **Phase 9 tiny-image** path (3.4 GB), add `SLEEP=2` to the 3a/3b `env`
+lines and install the plugin (see §4).
+
 > If vLLM is not in this repo's `.venv`, add `VLLM_HOME=/dir/containing/.venv` to
 > each `sudo env` line and use `"$VLLM_HOME/.venv/bin/python"` for the plot.
 
@@ -189,7 +201,7 @@ Swapping `MODEL`/`TAG` gives the MoE run
 
 | Path | Purpose |
 | --- | --- |
-| `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh`, `p6_sleep_test.sh`, `snapshot-manager` |
+| `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh`, `p6_sleep_test.sh`, `snapshot-manager`, `stop_vllm.sh` |
 | `scripts/dev/` | one-off/test probes (gitignored) |
 | `patches/` | `criu-link-remap-reusable.patch` (also in the CRIU fork) |
 | `plugin/` | out-of-tree vLLM plugin: in-place weight reload after `sleep(level=2)` |
