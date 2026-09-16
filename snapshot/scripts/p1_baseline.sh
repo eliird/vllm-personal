@@ -15,8 +15,13 @@
 # be miscounted as weight load.
 set -uo pipefail
 SNAP="$(cd "$(dirname "$0")/.." && pwd)"   # snapshot/
-VLLM_HOME="${VLLM_HOME:-$(cd "$SNAP/.." && pwd)}"  # vLLM checkout (holds .venv/)
-ROOT="$VLLM_HOME"
+# Resolve the vLLM environment: a repo-local .venv, else $VLLM_HOME/.venv.
+if [ -z "${VLLM_HOME:-}" ]; then
+  if [ -x "$SNAP/.venv/bin/vllm" ]; then VLLM_HOME="$SNAP"
+  else VLLM_HOME="$(cd "$SNAP/.." && pwd)"; fi
+fi
+VLLM_BIN="${VLLM_BIN:-$VLLM_HOME/.venv/bin/vllm}"
+VLLM_PY="${VLLM_PY:-$VLLM_HOME/.venv/bin/python}"
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8000}"
@@ -46,7 +51,7 @@ fi
 # model paths.
 if [ "$PRELOAD" = "1" ] && [ ! -d "$MODEL" ]; then
   echo "pre-fetching weights for $MODEL (HF cache warm; excluded from timing)..."
-  MODEL="$MODEL" "$ROOT/.venv/bin/python" -c \
+  MODEL="$MODEL" "$VLLM_PY" -c \
     'import os; from huggingface_hub import snapshot_download; snapshot_download(os.environ["MODEL"])' \
     >/dev/null 2>&1 || echo "  pre-fetch failed (continuing; download may appear in weights)"
 fi
@@ -59,8 +64,8 @@ READER=$!
 
 # shellcheck disable=SC2086
 T0=$(date +%s.%N)
-echo "launch_command: $ROOT/.venv/bin/vllm serve $MODEL --port $PORT --max-model-len $MAX_MODEL_LEN --gpu-memory-utilization $GPU_MEM_UTIL $EXTRA_ARGS" | tee -a "$VLOG"
-setsid env PYTHONUNBUFFERED=1 "$ROOT/.venv/bin/vllm" serve "$MODEL" --port "$PORT" \
+echo "launch_command: $VLLM_BIN serve $MODEL --port $PORT --max-model-len $MAX_MODEL_LEN --gpu-memory-utilization $GPU_MEM_UTIL $EXTRA_ARGS" | tee -a "$VLOG"
+setsid env PYTHONUNBUFFERED=1 "$VLLM_BIN" serve "$MODEL" --port "$PORT" \
   --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" \
   $EXTRA_ARGS > "$FIFO" 2>&1 &
 SRV=$!

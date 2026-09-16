@@ -5,8 +5,13 @@
 # Env: MODEL PORT TAG MAX_MODEL_LEN GPU_MEM_UTIL EXTRA_ARGS
 set -uo pipefail
 SNAP="$(cd "$(dirname "$0")/.." && pwd)"
-VLLM_HOME="${VLLM_HOME:-$(cd "$SNAP/.." && pwd)}"
-ROOT="$VLLM_HOME"
+# Resolve the vLLM environment: a repo-local .venv, else $VLLM_HOME/.venv.
+if [ -z "${VLLM_HOME:-}" ]; then
+  if [ -x "$SNAP/.venv/bin/vllm" ]; then VLLM_HOME="$SNAP"
+  else VLLM_HOME="$(cd "$SNAP/.." && pwd)"; fi
+fi
+VLLM_BIN="${VLLM_BIN:-$VLLM_HOME/.venv/bin/vllm}"
+VLLM_PY="${VLLM_PY:-$VLLM_HOME/.venv/bin/python}"
 
 MODEL="${MODEL:?set MODEL}"
 PORT="${PORT:-8500}"
@@ -25,7 +30,7 @@ ask() {
     -d "{\"model\":\"$MODEL\",\"prompt\":\"$PROMPT\",\"max_tokens\":8,\"temperature\":0}"
 }
 
-setsid env UV_USE_IO_URING=0 VLLM_SERVER_DEV_MODE=1 PYTHONUNBUFFERED=1 "$ROOT/.venv/bin/vllm" serve "$MODEL" \
+setsid env UV_USE_IO_URING=0 VLLM_SERVER_DEV_MODE=1 PYTHONUNBUFFERED=1 "$VLLM_BIN" serve "$MODEL" \
   --port "$PORT" --max-model-len "$MAX_MODEL_LEN" --gpu-memory-utilization "$GPU_MEM_UTIL" \
   --enable-sleep-mode $EXTRA_ARGS >> "$VLOG" 2>&1 &
 SRV=$!

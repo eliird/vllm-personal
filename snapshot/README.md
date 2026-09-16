@@ -85,30 +85,25 @@ S≈275 GB (weights-dominated) → ~135 s, the case Phase 9 targets.
 
 ## 2. Install
 
-This repo is standalone. It pairs with a pinned **vLLM checkout**, located via the
-`VLLM_HOME` environment variable (which provides the `.venv` the scripts call).
-Tested on Ubuntu 22.04, 1× NVIDIA GPU (driver ≥ 570; here 580.178.04).
+This repo is standalone tooling. It assumes **vLLM is installed in a Python
+environment** (so `vllm serve` and `python` are available); it does not need the
+vLLM source tree. Tested on Ubuntu 22.04, 1× NVIDIA GPU (driver ≥ 570; here
+580.178.04).
 
 ```bash
-# 1. Clone this repo and the pinned vLLM fork side by side, then point VLLM_HOME at it
-git clone git@github.com:eliird/vllm-snapshot.git
-git clone git@github.com:eliird/vllm-personal.git
-cd vllm-snapshot
-export VLLM_HOME="$(cd ../vllm-personal && pwd)"     # add to ~/.bashrc to persist
+# 1. vLLM in this repo's venv (precompiled wheel; no local build)
+uv venv --python 3.12 .venv          # or: python3 -m venv .venv
+source .venv/bin/activate
+VLLM_USE_PRECOMPILED=1 uv pip install vllm --torch-backend=auto
+# The scripts auto-detect this repo's .venv. If vLLM is installed elsewhere,
+# export VLLM_HOME=/dir/containing/.venv (and pass it through sudo for dumps).
 
-# 2. vLLM env in $VLLM_HOME (precompiled wheel; no local vLLM build). See vllm.lock.
-( cd "$VLLM_HOME"
-  git checkout feat/checkpoint-restore
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  uv venv --python 3.12 .venv
-  VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto )
-
-# 3. CUDA toolkit (nvcc; needed for JIT warmup)
+# 2. CUDA toolkit (nvcc; needed for JIT warmup)
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
 sudo apt-get install -y --no-install-recommends cuda-toolkit-13-2
 
-# 4. CRIU >= 4.0 + CUDA plugin. Use the fork that carries the link-remap reuse fix;
+# 3. CRIU >= 4.0 + CUDA plugin. Use the fork that carries the link-remap reuse fix;
 #    alternatively apply patches/criu-link-remap-reusable.patch to upstream CRIU.
 sudo apt-get install -y build-essential pkg-config protobuf-c-compiler \
   libprotobuf-c-dev libprotobuf-dev protobuf-compiler libnl-3-dev \
@@ -120,34 +115,32 @@ git clone git@github.com:eliird/CRIU-multiprocess.git /tmp/criu
   sudo install -m 0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so )
 # (plain `make install` also builds man pages, which needs asciidoc)
 
-# 5. cuda-checkpoint (NVIDIA ships a prebuilt binary)
+# 4. cuda-checkpoint (NVIDIA ships a prebuilt binary)
 git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 sudo install -m 0755 /tmp/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/local/bin/cuda-checkpoint
 
-# 6. Model (download using the vLLM venv)
-"$VLLM_HOME/.venv/bin/hf" download Qwen/Qwen3-4B
+# 5. Model
+hf download Qwen/Qwen3-4B
 ```
 
-Verify (with `VLLM_HOME` set):
+Verify:
 
 ```bash
 nvidia-smi --query-gpu=name,driver_version,memory.total,compute_cap --format=csv
 criu --version && ls /usr/lib/criu/cuda_plugin.so
 cuda-checkpoint --help 2>&1 | head -2
-"$VLLM_HOME/.venv/bin/python" -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
+python -c "import vllm, torch; print(vllm.__version__, torch.cuda.is_available())"
 ```
 
-> `VLLM_HOME` **defaults to this repo's parent directory**, so a side-by-side
-> `vllm-personal/` checkout needs no setting. The scripts use `VLLM_HOME` only for
-> the vLLM binary/venv; run outputs (`logs/`, `plots/`, `snapshots/`) stay in this
-> repo. Pinned vLLM commit/wheel: [`vllm.lock`](vllm.lock).
+> The scripts find vLLM in this repo's `.venv` (or `$VLLM_HOME/.venv`); run outputs
+> (`logs/`, `plots/`, `snapshots/`) stay in this repo.
 
 ---
 
 ## 3. Reproduce the 3 runs (Qwen3-4B)
 
 Workflow: cold (no compile cache) → warm (cache reused) → snapshot → restore.
-Run all commands **from this repo's root** (`VLLM_HOME` set). Outputs land in
+Run all commands **from this repo's root**, with the venv active. Outputs land in
 `logs/` and `plots/` (both gitignored). Snapshot/restore steps need root.
 
 ```bash
@@ -163,22 +156,25 @@ MODEL=Qwen/Qwen3-4B PORT=8401 TAG=qwen3_4b_warm CLEAR_CACHE=0 \
 
 # Run 3a — snapshot a warm worker (clean /dev/shm BEFORE the snapshot)
 sudo rm -f /dev/shm/link_remap.* /dev/shm/sem.*
-sudo env VLLM_HOME="$VLLM_HOME" MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
+sudo env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
   MODE=plugin IMG=/tmp/p4_snap_qwen3_4b MAX_MODEL_LEN=4096 GPU_MEM_UTIL=0.90 \
   timeout 900 bash scripts/p4_snapshot_vllm.sh 2>&1 | tee logs/run_snapshot.log
 
 # Run 3b — restore and verify one inference (do NOT touch /dev/shm first)
-sudo env VLLM_HOME="$VLLM_HOME" MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
+sudo env MODEL=Qwen/Qwen3-4B PORT=8411 TAG=qwen3_4b \
   MODE=plugin IMG=/tmp/p4_snap_qwen3_4b EXPECT=Paris \
   timeout 600 bash scripts/p4_restore_vllm.sh 2>&1 | tee logs/run_restore.log
 
 # Plot cold vs warm vs restore
-"$VLLM_HOME/.venv/bin/python" scripts/p1_visualize_breakdown.py \
+.venv/bin/python scripts/p1_visualize_breakdown.py \
   --cold-log logs/p1_qwen3_4b_cold_vllm.log \
   --warm-log logs/p1_qwen3_4b_warm_vllm.log \
   --restore-json logs/p4_qwen3_4b_restore_times.json \
   --label Qwen3-4B --out plots/startup_breakdown_qwen3_4b.png
 ```
+
+> If vLLM is not in this repo's `.venv`, add `VLLM_HOME=/dir/containing/.venv` to
+> each `sudo env` line and use `"$VLLM_HOME/.venv/bin/python"` for the plot.
 
 Swapping `MODEL`/`TAG` gives the MoE run
 (`Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4`, port 8420). Full runbook details
@@ -193,7 +189,7 @@ Swapping `MODEL`/`TAG` gives the MoE run
 | `patches/` | `criu-link-remap-reusable.patch` (also in the CRIU fork) |
 | `results/` | `stack.txt`, `verification/` |
 | `images/` | figures embedded in this README (tracked) |
-| `vllm.lock` | pinned vLLM commit/wheel (pair with `VLLM_HOME`) |
+| `vllm.lock` | vLLM version this was tested against (scripts use repo `.venv` or `$VLLM_HOME`) |
 | `logs/`, `plots/`, `snapshots/` | run outputs (gitignored) |
 
 ---
@@ -316,14 +312,12 @@ graph replay). Fold into Phase 6/7 verification.
 
 ```bash
 # create from an already-running worker (quiesce via /sleep, then CRIU dump)
-sudo env VLLM_HOME="$VLLM_HOME" "$VLLM_HOME/.venv/bin/python" \
-  scripts/snapshot-manager create <name> \
+sudo .venv/bin/python scripts/snapshot-manager create <name> \
   --pid <vllm-pid> --port <port> --model Qwen/Qwen3-4B --sleep 1
-"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager list
-"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager status <name>
-sudo env VLLM_HOME="$VLLM_HOME" "$VLLM_HOME/.venv/bin/python" \
-  scripts/snapshot-manager restore <name> --port <port>
-"$VLLM_HOME/.venv/bin/python" scripts/snapshot-manager delete <name>
+.venv/bin/python scripts/snapshot-manager list
+.venv/bin/python scripts/snapshot-manager status <name>
+sudo .venv/bin/python scripts/snapshot-manager restore <name> --port <port>
+.venv/bin/python scripts/snapshot-manager delete <name>
 ```
 Snapshots live in `snapshots/<name>/` in this repo (gitignored); `create`/`restore`
 need root for CRIU. Verified end-to-end: create (14.6 GB) → restore → correct

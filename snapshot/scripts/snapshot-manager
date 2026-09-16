@@ -29,10 +29,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SNAP = HERE.parent
-ROOT = Path(os.environ.get("VLLM_HOME", SNAP.parent))  # vLLM checkout
+_local = SNAP / ".venv" / "bin" / "vllm"
+VLLM_HOME = Path(os.environ.get("VLLM_HOME", str(SNAP) if _local.exists() else str(SNAP.parent)))
 SNAPDIR = SNAP / "snapshots"
-VLLM = ROOT / ".venv" / "bin" / "vllm"
-PY = ROOT / ".venv" / "bin" / "python"
+VLLM = Path(os.environ.get("VLLM_BIN", VLLM_HOME / ".venv" / "bin" / "vllm"))
+PY = Path(os.environ.get("VLLM_PY", VLLM_HOME / ".venv" / "bin" / "python"))
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
