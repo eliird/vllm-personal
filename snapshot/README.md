@@ -81,64 +81,6 @@ dominated by `C+G+U`; warm still re-pays `W` and `G`; snapshot removes them all.
 Projections: 80 GB card (u=0.9) → S≈75 GB → ~37 s; 500B-class 4-bit capped →
 S≈275 GB (weights-dominated) → ~135 s, the case Phase 9 targets.
 
-### Phase 6/7 — sleep / KV discard
-
-`/sleep?level=1` offloads weights to CPU pinned RAM and discards the KV cache
-(no SSD involved; `level=2` discards both with no backup).
-
-| | Full worker | Slept worker (`level=1`) |
-| --- | ---: | ---: |
-| GPU memory before dump | 14.8 GiB | **1.81 GiB** |
-| Image on disk | 17.1 GB | **14.7 GB** (−2.3) |
-| CRIU dump | 13–15 s | 8.8 s |
-| `criu restore` call | 8.0–8.7 s | **4.7 s** |
-| restore → first response | 8.44 s | **7.95 s** |
-| correctness | PASS | PASS |
-
-vLLM reports: `sleep freed 12.07 GiB … 7.72 GiB backed up in CPU … 4.36 GiB
-discarded … 1.81 GiB still in use`. Diagnosis (`crit` on the images): the model
-file is not mmap'd into the image; the slept image is dominated by the **7.72 GiB
-weights CPU backup** + host/CUDA-driver memory. The 4.36 GiB KV discard only
-netted **−2.3 GB** on disk because ~2 GB of host/driver bookkeeping (and 7→158
-shm segments) reappears after sleep.
-
-**Conclusion:** KV placeholding saves nothing (KV is already discarded); the
-lever is **Phase 9 — keep weights out of the image** (`level=2` + reload/resident
-weights).
-
-### Phase 8 — restore profile
-
-Slept (`level=1`) restore decomposition:
-
-| Stage | Time |
-| --- | ---: |
-| `criu restore` (read 14.7 GB image + restore host pages) | 3.6 s (~4 GB/s) |
-| `wake_up` (host→device weights ~7.7 GB + KV realloc) | ~0.9 s |
-| ready after wake | ~2.0 s |
-| first response | +0.27 s |
-| **total restore → first response** | **6.8 s** |
-
-### Phase 9 — weight separation (size achieved; reload still needed)
-
-`sleep(level=2)` discards weights and KV with **no CPU backup**
-(`0.00 GiB backed up; 13.37 GiB discarded`):
-
-| | Full | Slept L1 | **Slept L2** |
-| --- | ---: | ---: | ---: |
-| Image | 17.1 GB | 14.7 GB | **3.4 GB** |
-| CRIU dump | 13–15 s | 8.8 s | **2.0 s** |
-| GPU after sleep | — | 1.8 GiB | 1.2 GiB |
-| `criu restore` | 8.0–8.7 s | 4.7 s | **1.8 s** |
-| restore → first response | 8.44 s | 7.95 s | **4.36 s** |
-| correct? | yes | yes | **no — garbage** |
-
-**3.4 GB is the size ceiling** (weights fully out of the image). But a `level=2`
-restore serves garbage (`"!!!!!!!!"`) because the weights are gone and vLLM has
-no disk-reload on wake — `update_weights` is a trainer→worker transport, not a
-reload. Completing Phase 9 needs a reload hook (a `SleepModeBackend` plugin or an
-equivalent path) before the "correct inference" gate can pass. **This is a design
-decision for the next phase.**
-
 ---
 
 ## 2. Install
@@ -249,9 +191,71 @@ Swapping `MODEL`/`TAG` gives the MoE run
 
 ---
 
-## 4. Open issues and roadmap
+## 4. Phase progress
 
-### 4.1 `/dev/shm` link-remap made snapshots one-shot  *(fixed)*
+### Phase 6/7 — sleep / KV discard
+
+`/sleep?level=1` offloads weights to CPU pinned RAM and discards the KV cache
+(no SSD involved; `level=2` discards both with no backup).
+
+| | Full worker | Slept worker (`level=1`) |
+| --- | ---: | ---: |
+| GPU memory before dump | 14.8 GiB | **1.81 GiB** |
+| Image on disk | 17.1 GB | **14.7 GB** (−2.3) |
+| CRIU dump | 13–15 s | 8.8 s |
+| `criu restore` call | 8.0–8.7 s | **4.7 s** |
+| restore → first response | 8.44 s | **7.95 s** |
+| correctness | PASS | PASS |
+
+vLLM reports: `sleep freed 12.07 GiB … 7.72 GiB backed up in CPU … 4.36 GiB
+discarded … 1.81 GiB still in use`. Diagnosis (`crit` on the images): the model
+file is not mmap'd into the image; the slept image is dominated by the **7.72 GiB
+weights CPU backup** + host/CUDA-driver memory. The 4.36 GiB KV discard only
+netted **−2.3 GB** on disk because ~2 GB of host/driver bookkeeping (and 7→158
+shm segments) reappears after sleep.
+
+**Conclusion:** KV placeholding saves nothing (KV is already discarded); the
+lever is **Phase 9 — keep weights out of the image** (`level=2` + reload/resident
+weights).
+
+### Phase 8 — restore profile
+
+Slept (`level=1`) restore decomposition:
+
+| Stage | Time |
+| --- | ---: |
+| `criu restore` (read 14.7 GB image + restore host pages) | 3.6 s (~4 GB/s) |
+| `wake_up` (host→device weights ~7.7 GB + KV realloc) | ~0.9 s |
+| ready after wake | ~2.0 s |
+| first response | +0.27 s |
+| **total restore → first response** | **6.8 s** |
+
+### Phase 9 — weight separation (size achieved; reload still needed)
+
+`sleep(level=2)` discards weights and KV with **no CPU backup**
+(`0.00 GiB backed up; 13.37 GiB discarded`):
+
+| | Full | Slept L1 | **Slept L2** |
+| --- | ---: | ---: | ---: |
+| Image | 17.1 GB | 14.7 GB | **3.4 GB** |
+| CRIU dump | 13–15 s | 8.8 s | **2.0 s** |
+| GPU after sleep | — | 1.8 GiB | 1.2 GiB |
+| `criu restore` | 8.0–8.7 s | 4.7 s | **1.8 s** |
+| restore → first response | 8.44 s | 7.95 s | **4.36 s** |
+| correct? | yes | yes | **no — garbage** |
+
+**3.4 GB is the size ceiling** (weights fully out of the image). But a `level=2`
+restore serves garbage (`"!!!!!!!!"`) because the weights are gone and vLLM has
+no disk-reload on wake — `update_weights` is a trainer→worker transport, not a
+reload. Completing Phase 9 needs a reload hook (a `SleepModeBackend` plugin or an
+equivalent path) before the "correct inference" gate can pass. **This is a design
+decision for the next phase.**
+
+---
+
+## 5. Open issues and roadmap
+
+### 5.1 `/dev/shm` link-remap made snapshots one-shot  *(fixed)*
 vLLM's engine runs in a Python multiprocessing child; CPython creates POSIX
 semaphores `/dev/shm/sem.mp-*` (hard-linked twice). CRIU needs `--link-remap`,
 but the `link_remap.*` temp was consumed/renamed by the first restore, so later
@@ -273,7 +277,7 @@ from the fork (`git clone`, `make`, `make install-criu install-cuda_plugin`, cop
 > (Running vLLM single-process `VLLM_ENABLE_V1_MULTIPROCESSING=0` also avoids the
 > semaphores, but costs performance.)
 
-### 4.2 Image size = full device state  *(optimization)*
+### 5.2 Image size = full device state  *(optimization)*
 Images (~17 GB) capture the entire GPU footprint, dominated by the **idle KV
 cache** (Qwen1.5B was 10 GB of KV) and the weights.
 - **KV discard / offload** before snapshot (vLLM `sleep`, Phase 6/7) instead of
@@ -281,12 +285,12 @@ cache** (Qwen1.5B was 10 GB of KV) and the weights.
 - **Weight separation** (Phase 9): keep weights out of the image entirely for the
   large-model regime (~270 GB of weights is otherwise the whole image).
 
-### 4.3 Correctness hardening
+### 5.3 Correctness hardening
 Beyond one correct response: repeated restores (once images are reusable) and a
 **soak test** (many requests after restore, exercising fresh KV allocation and
 graph replay). Fold into Phase 6/7 verification.
 
-### 4.4 Remaining phases
+### 5.4 Remaining phases
 | Phase | Status |
 | --- | --- |
 | 0a/0b stack + CUDA round-trip | done, verified |
@@ -316,14 +320,14 @@ Verified end-to-end: create (14.6 GB) → restore → correct inference → dele
 driver/GPU/CUDA mismatch on restore is **refused** (exit 2), so snapshots are
 documented as ephemeral across driver upgrades.
 
-### 4.5 Scale / production
+### 5.5 Scale / production
 - **Kubernetes**: this is non-K8s today. At scale we need a per-Pod sidecar/manager
   that drives quiesce → snapshot → restore, with restores pinned to compatible
   drivers/GPUs. Snapshots are **ephemeral across driver upgrades** (hard-fail on
   mismatch).
 - Driver/CRIU/plugin versions move quickly; pin the stack and re-validate.
 
-### 4.6 Smaller caveats
+### 5.6 Smaller caveats
 - `UV_USE_IO_URING=0` is required (CRIU cannot dump uvloop's `io_uring`).
 - Do not mix integration modes: plugin (CRIU drives `cuda-checkpoint`) vs manual
   `--toggle` (must use an empty `--libdir`).
