@@ -1,0 +1,67 @@
+== date ==
+Tue 15 Sep 10:30:01 UTC 2026
+== kernel ==
+Linux yuya-sakamoto 6.8.0-138-generic #138~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Aug  7 13:43:15 UTC  x86_64 x86_64 x86_64 GNU/Linux
+== distro ==
+Ubuntu 22.04.5 LTS
+== is WSL ==
+no
+== gpu ==
+name, driver_version, memory.total [MiB], compute_cap
+NVIDIA GeForce RTX 4060 Ti, 580.178.04, 16380 MiB, 8.9
+== gpu count ==
+1
+== cuda toolkit ==
+no nvcc
+== cuda-checkpoint ==
+/usr/local/bin/cuda-checkpoint
+CUDA checkpoint and restore utility.
+Version 580.178.04. Copyright (C) 2026 NVIDIA Corporation. All rights reserved.
+
+Operations:
+--get-state --pid <pid>
+== criu ==
+Version: 4.2.1
+GitID: 33482a1
+== criu plugins ==
+total 60
+drwxr-xr-x   2 root root  4096 Sep 15 10:28 .
+drwxr-xr-x 126 root root  4096 Sep 15 10:28 ..
+-rwxr-xr-x   1 root root 50112 Sep 15 10:28 cuda_plugin.so
+== nvidia devices ==
+/dev/nvidia0
+/dev/nvidiactl
+/dev/nvidia-modeset
+/dev/nvidia-uvm
+/dev/nvidia-uvm-tools
+
+/dev/nvidia-caps:
+nvidia-cap1
+nvidia-cap2
+== nvidia proc ==
+0000:01:00.0
+== vllm ==
+0.29.1rc1.dev135+g39651f804
+== Phase 0b GPU guard ==
+name, driver_version, memory.total [MiB], mig.mode.current
+NVIDIA GeForce RTX 4060 Ti, 580.178.04, 16380 MiB, [N/A]
+GPU 0: NVIDIA GeForce RTX 4060 Ti (UUID: GPU-62e4bec0-84fc-2397-7bfa-5176eddc5ad7)
+CUDA checkpoint and restore utility.
+Version 580.178.04. Copyright (C) 2026 NVIDIA Corporation. All rights reserved.
+
+== MPS daemon ==
+no MPS daemon
+== nvcc ==
+Cuda compilation tools, release 13.2, V13.2.86
+Build cuda_13.2.r13.2/compiler.37953736_0
+
+== Phase 1 models ==
+gpt-oss-20b: openai/gpt-oss-20b, MoE MXFP4, repo on disk 39G (mxfp4 shards 13.76G used by vLLM), gpu_count=1, backend=MARLIN (sm_89)
+small: Qwen/Qwen2.5-1.5B-Instruct, dense, on disk 2.9G, backend=default (compile+CUDA graphs)
+gpt-oss launch: --cpu-offload-gb 6 --enforce-eager --max-model-len 2048 --gpu-memory-utilization 0.90
+
+== Model set (revised) ==
+dense: Qwen/Qwen3-4B (bf16, 8.04 GB, fully device-resident, default compile+CUDA graphs)
+moe:   Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4 (4-bit GPTQ, 8.41 GB, sparse MoE 14.3B total/2.7B active)
+excluded: openai/gpt-oss-20b (MXFP4 13.8 GB) — OOM on 16 GB without --cpu-offload-gb; not device-resident, removed.
+excluded: Qwen/Qwen2.5-1.5B-Instruct — superseded by Qwen3-4B; removed.

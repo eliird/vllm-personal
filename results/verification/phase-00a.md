@@ -1,0 +1,8 @@
+# Phase 0a verification — 2026-09-15 — yuya-sakamoto
+- R1 CRIU health: PASS — criu 4.2.1 (GitID 33482a1) at /usr/local/sbin/criu; `criu check --all` only emits two non-blocking warnings (no libnftables locking, STATMOUNT_BY_FD unavailable); evidence `results/verification/r1_criu_check_verifier.log`.
+- R2 plugin load: PASS — real dump invoked the plugin: `Error (cuda_plugin.c:221): cuda_plugin: Failed to launch cuda-checkpoint ...` (4 lines) in the verifier dump log for a plain non-CUDA process; /usr/lib/criu/cuda_plugin.so is a 50112-byte ELF and /proc/driver/nvidia/gpus exists (plugin enabled); evidence `results/verification/r3_plain_roundtrip_verifier.log`.
+- R3 plain-process round-trip: PASS — before=3 after=6 (verifier-owned counter at /tmp/verify_p0_plain; PID 34931 survived restore and kept incrementing 8→10).
+- R4 staged artifacts: PASS — p0_cuda_min.cu has cudaMalloc/__global__/checksum; p0_cuda_roundtrip.sh has MODE switch plus cuda-checkpoint and criu dump/restore; p0_cuda_min_torch.py exists; RESULTS.md has only a "## Phase 0a" section and makes no GPU-roundtrip claim; results/stack.txt and required logs/scripts are all present and non-empty.
+- Blocking criu check failures: none (only two warnings: missing libnftables set-concatenation support; STATMOUNT_BY_FD unavailable. Neither blocks CPU socket/FD/namespace checkpointing.)
+- Overall: PASS
+- Notes / human action required: Independently reproduced — verifier ran its own counter, not the implementer's script. The cuda_plugin emits "Failed to launch cuda-checkpoint to retrieve restore tid" even for non-CUDA plain processes; harmless here, but expected GPU (Phase 0b) behavior is unverified. `nvcc` absent so Phase 0b must use the torch path; no human action required for Phase 0a gate.
