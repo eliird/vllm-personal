@@ -41,6 +41,13 @@ Detailed per-phase narrative: [`report.md`](report.md). Independent verifier
 verdicts: [`results/verification/`](results/verification/). Exact stack:
 [`results/stack.txt`](results/stack.txt).
 
+### Restored checkpoint startup (demo)
+
+Cold start ≈130 s, warm ≈40 s; the snapshot-restored worker is serving in a few
+seconds:
+
+![Snapshot restore demo](videos/restore-demo.gif)
+
 ### Why restore is ~constant across models
 
 Both configs use `--gpu-memory-utilization 0.9`, so vLLM sizes the KV cache to
