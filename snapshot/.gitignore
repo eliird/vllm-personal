@@ -8,6 +8,7 @@ scripts/dev/
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
 
 # OS/editor
 .DS_Store

@@ -98,6 +98,8 @@ source .venv/bin/activate
 uv pip install "vllm==0.29.1rc1.dev134+g8263ea12b" \
   --extra-index-url https://wheels.vllm.ai/8263ea12bd8fa7584277f5200d521193259707b7/cu130/ \
   --torch-backend=auto
+# out-of-tree plugin: reload weights in place after sleep level 2 (Phase 9)
+uv pip install -e plugin
 # The scripts auto-detect this repo's .venv. If vLLM is installed elsewhere,
 # export VLLM_HOME=/dir/containing/.venv (and pass it through sudo for dumps).
 
@@ -190,6 +192,7 @@ Swapping `MODEL`/`TAG` gives the MoE run
 | `scripts/` | reusable: `p1_baseline.sh`, `p1_parse_breakdown.py`, `p1_visualize_breakdown.py`, `p4_snapshot_vllm.sh`, `p4_restore_vllm.sh`, `p6_sleep_test.sh`, `snapshot-manager` |
 | `scripts/dev/` | one-off/test probes (gitignored) |
 | `patches/` | `criu-link-remap-reusable.patch` (also in the CRIU fork) |
+| `plugin/` | out-of-tree vLLM plugin: in-place weight reload after `sleep(level=2)` |
 | `results/` | `stack.txt`, `verification/` |
 | `images/` | figures embedded in this README (tracked) |
 | `vllm.lock` | vLLM version this was tested against (scripts use repo `.venv` or `$VLLM_HOME`) |
@@ -236,26 +239,32 @@ Slept (`level=1`) restore decomposition:
 | first response | +0.27 s |
 | **total restore → first response** | **6.8 s** |
 
-### Phase 9 — weight separation (size achieved; reload still needed)
+### Phase 9 — weight separation / small-image restore  *(done)*
 
 `sleep(level=2)` discards weights and KV with **no CPU backup**
-(`0.00 GiB backed up; 13.37 GiB discarded`):
+(`0.00 GiB backed up; 13.37 GiB discarded`). The `vllm-snapshot-plugin` then
+reloads the weights **in place** after wake, so the tiny image serves correctly.
 
-| | Full | Slept L1 | **Slept L2** |
+| | Full | Slept L1 | **Slept L2 + plugin** |
 | --- | ---: | ---: | ---: |
 | Image | 17.1 GB | 14.7 GB | **3.4 GB** |
 | CRIU dump | 13–15 s | 8.8 s | **2.0 s** |
-| GPU after sleep | — | 1.8 GiB | 1.2 GiB |
-| `criu restore` | 8.0–8.7 s | 4.7 s | **1.8 s** |
-| restore → first response | 8.44 s | 7.95 s | **4.36 s** |
-| correct? | yes | yes | **no — garbage** |
+| GPU after sleep | — | 1.8 GiB | 1.3 GiB |
+| `criu restore` | 8.0–8.7 s | 4.7 s | **1.7 s** |
+| weights reload | — | — | **1.0 s** (in place) |
+| restore → first response | 8.44 s | 7.95 s | **5.27 s** |
+| correct? | yes | yes | **yes** (`" Paris."`) |
 
-**3.4 GB is the size ceiling** (weights fully out of the image). But a `level=2`
-restore serves garbage (`"!!!!!!!!"`) because the weights are gone and vLLM has
-no disk-reload on wake — `update_weights` is a trainer→worker transport, not a
-reload. Completing Phase 9 needs a reload hook (a `SleepModeBackend` plugin or an
-equivalent path) before the "correct inference" gate can pass. **This is a design
-decision for the next phase.**
+**Completing this needed one out-of-tree piece:** `Worker.sleep(level=2)` saves
+only buffers, and `wake_up` leaves the weight **parameters** empty. The plugin
+(`plugin/`, installed via the `vllm.general_plugins` entry point) wraps the worker
+so a level-2 wake calls the model loader's documented standalone
+`load_weights(model, model_config)` **in place** — preserving tensor addresses so
+compiled kernels and CUDA graphs stay valid. No vLLM core changes.
+
+Build: `uv pip install -e plugin` (into the vLLM venv). Then snapshot/restore
+with `SLEEP=2` as in §3. This is the best configuration on both size and restore
+time.
 
 ---
 
@@ -307,7 +316,7 @@ graph replay). Fold into Phase 6/7 verification.
 | 5 quiesce lifecycle + thin `snapshot-manager` CLI | done (create/restore/list/status/delete + compatibility guard) |
 | 6+7 sleep / KV discard | done: GPU 14.8→1.8 GiB, image 17.1→14.7 GB, restore 8.44→6.8 s |
 | 8 restore profiling | done: CRIU 3.6 s + wake 0.9 s + ready 2.0 s |
-| 9 weight separation | size ceiling reached (image **3.4 GB**); needs a weight-reload hook to serve |
+| 9 weight separation | done: image **3.4 GB**, in-place weight reload (plugin), restore→first 5.27 s, correct |
 | 10 multi-GPU / TP-EP | N/A (single GPU) |
 | 11 production manager (create/list/restore/delete, driver guard) | done (same CLI) |
 

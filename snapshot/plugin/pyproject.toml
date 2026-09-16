@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-snapshot-plugin"
+version = "0.1.0"
+description = "Out-of-tree vLLM plugin: reload weights in place after sleep level 2 (durable snapshot / CRIU restore)"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+vllm_snapshot_plugin = "vllm_snapshot_plugin:register"
+
+[tool.setuptools]
+packages = ["vllm_snapshot_plugin"]
